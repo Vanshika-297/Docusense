@@ -9,6 +9,10 @@ export interface ChatResult {
   answer: string;
   sources: string[];
 }
+export interface ChatHistoryMessage {
+  role: "user" | "bot";
+  text: string;
+}
 
 export const MAX_PDF_BYTES = 4 * 1024 * 1024; // Matches the server limit (4MB)
 
@@ -51,10 +55,14 @@ export function uploadPdf(file: File): Promise<Session> {
 }
 
 // Asks a question about the uploaded PDF.
-export function askQuestion(sessionId: string, question: string): Promise<ChatResult> {
+export function askQuestion(
+  sessionId: string,
+  question: string,
+  history?: ChatHistoryMessage[]
+): Promise<ChatResult> {
   return request<ChatResult>("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId, question }),
+    body: JSON.stringify({ sessionId, question, history }),
   });
 }

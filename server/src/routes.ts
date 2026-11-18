@@ -81,16 +81,20 @@ router.post("/upload", (req: Request, res: Response, next: NextFunction) => {
 // Chat: retrieve top chunks for this session and answer from them only.
 router.post("/chat", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sessionId, question } = req.body ?? {};
+    const { sessionId, question, history } = req.body ?? {};
     if (typeof sessionId !== "string" || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
       throw new AppError("Invalid session. Please upload your PDF again.");
     }
     if (typeof question !== "string" || !question.trim()) {
       throw new AppError("Please type a question.");
     }
-    if (question.length > 1000) throw new AppError("Question is too long (max 1000 characters).");
+    if (question.length > 2000) throw new AppError("Question is too long (max 2000 characters).");
 
-    const result = await withTimeout(answerQuestion(sessionId, question.trim()), 50_000);
+    const validatedHistory = Array.isArray(history)
+      ? history.filter((h) => h && typeof h.text === "string" && (h.role === "user" || h.role === "bot"))
+      : [];
+
+    const result = await withTimeout(answerQuestion(sessionId, question.trim(), validatedHistory), 50_000);
     res.json(result);
   } catch (e) {
     next(e);

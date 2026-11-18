@@ -5,8 +5,18 @@ import type { Document } from "@langchain/core/documents";
 import { EMBEDDING_MODEL, TOP_K, requireEnv } from "./config";
 import { AppError } from "./pdf";
 
-// Tried in order, because Google retires Gemini models often.
-const CHAT_MODELS = ["gemini-flash-latest", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"];
+export interface ChatHistoryItem {
+  role: "user" | "bot";
+  text: string;
+}
+
+// Tried in order: modern Gemini Flash models.
+const CHAT_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+  "gemini-flash-latest",
+];
 
 // Builds the Gemini embeddings client.
 function getEmbeddings() {
@@ -30,21 +40,38 @@ export async function ingestChunks(sessionId: string, docs: Document[]) {
   });
 }
 
-// Calls Gemini's REST endpoint directly so every failure shows a real status.
-async function generate(model: string, prompt: string): Promise<string> {
+// Calls Gemini's REST endpoint with system instructions and generous timeout.
+async function generate(model: string, userPrompt: string, systemInstruction?: string): Promise<string> {
   console.log(`Calling Gemini ${model}...`);
+  const payload: any = {
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 2048,
+    },
+  };
+
+  if (systemInstruction) {
+    payload.systemInstruction = {
+      parts: [{ text: systemInstruction }],
+    };
+  }
+
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": requireEnv("GEMINI_API_KEY") },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0 },
-    }),
-    signal: AbortSignal.timeout(12_000),
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": requireEnv("GEMINI_API_KEY"),
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30_000),
   });
+
   const body = await res.text();
   console.log(`Gemini ${model} -> ${res.status}`);
-  if (!res.ok) throw Object.assign(new Error(`${res.status} ${body.slice(0, 300)}`), { status: res.status });
+  if (!res.ok) {
+    throw Object.assign(new Error(`${res.status} ${body.slice(0, 300)}`), { status: res.status });
+  }
 
   const data = JSON.parse(body);
   const text = (data.candidates?.[0]?.content?.parts ?? []).map((p: any) => p.text ?? "").join("").trim();
@@ -52,46 +79,105 @@ async function generate(model: string, prompt: string): Promise<string> {
   return text;
 }
 
-// Retrieves the top chunks and asks Gemini to answer only from them.
-export async function answerQuestion(sessionId: string, question: string) {
+// Retrieves top chunks and answers user questions intelligently and conversationally.
+export async function answerQuestion(
+  sessionId: string,
+  question: string,
+  history: ChatHistoryItem[] = []
+) {
+  const trimmedQ = question.trim();
+  const isGreeting = /^(hi|hello|hey|hola|namaste|greetings|who are you|kaise ho|kya haal hai|help)\b/i.test(trimmedQ);
+
   let matches: Document[] = [];
   try {
     const store = await PineconeStore.fromExistingIndex(getEmbeddings(), {
       pineconeIndex: getIndex(),
       namespace: sessionId,
     });
-    matches = await store.similaritySearch(question, TOP_K);
-    console.log(`Retrieved ${matches.length} chunks`);
+
+    // Smart query expansion: if user asked a short/follow-up question (e.g. "who made it?", "features?"),
+    // combine with previous user query so vector search retrieves relevant chunks.
+    let searchQuery = trimmedQ;
+    if (!isGreeting && trimmedQ.split(/\s+/).length <= 4 && history.length > 0) {
+      const prevUserMessage = [...history].reverse().find((m) => m.role === "user");
+      if (prevUserMessage) {
+        searchQuery = `${prevUserMessage.text} ${trimmedQ}`;
+      }
+    }
+
+    matches = await store.similaritySearch(searchQuery, TOP_K);
+    console.log(`Retrieved ${matches.length} chunks for query: "${searchQuery}"`);
+
+    // If similarity search returned 0 matches and it's not a greeting, try a broader search
+    if (matches.length === 0 && !isGreeting) {
+      matches = await store.similaritySearch("summary overview introduction details", TOP_K);
+      console.log(`Fallback retrieved ${matches.length} chunks`);
+    }
   } catch (e: any) {
     console.error("Retrieval failed:", e?.message || e);
     throw new AppError(`Could not search your PDF: ${String(e?.message || e).slice(0, 300)}`, 502);
   }
 
-  if (matches.length === 0) {
-    return { answer: "I couldn't find anything in this PDF to answer that.", sources: [] as string[] };
+  // Handle conversational greetings gracefully
+  if (isGreeting && matches.length === 0) {
+    return {
+      answer: "Hello! I am DocuSense AI. I have analyzed your document and I am ready to answer any questions, explain concepts, or summarize sections for you. What would you like to know?",
+      sources: [] as string[],
+    };
   }
 
-  const context = matches.map((d, i) => `[${i + 1}] ${d.pageContent}`).join("\n\n");
-  const prompt =
-    "You answer questions about a PDF using ONLY the context below.\n" +
-    "If the answer is not in the context, reply exactly: \"I couldn't find that in the PDF.\"\n" +
-    "Do not use outside knowledge.\n\n" +
-    `Context:\n${context}\n\nQuestion: ${question}\nAnswer:`;
+  if (matches.length === 0) {
+    return {
+      answer: "I couldn't find specific information regarding that in the uploaded document. Could you try rephrasing or asking about a specific section or topic from the document?",
+      sources: [] as string[],
+    };
+  }
 
-  // Falls through the model list until one answers.
+  const context = matches
+    .map((d, i) => `[Chunk ${i + 1}${d.metadata?.source ? ` (${d.metadata.source})` : ""}]\n${d.pageContent}`)
+    .join("\n\n");
+
+  const formattedHistory =
+    history.length > 0
+      ? history
+          .slice(-6)
+          .map((m) => `${m.role === "user" ? "User" : "DocuSense"}: ${m.text}`)
+          .join("\n")
+      : "";
+
+  const systemInstruction =
+    "You are DocuSense AI, an intelligent, helpful, and comprehensive document assistant.\n" +
+    "Your objective is to answer the user's questions clearly, accurately, and thoroughly using the provided document context.\n\n" +
+    "Instructions:\n" +
+    "1. Base your answers on the provided document context. Extract relevant points, synthesize concepts, and provide structured, well-formatted answers (using markdown, bullet points, and headers where helpful).\n" +
+    "2. Language: Always answer in the SAME language that the user asks in. If the user asks in Hindi or Hinglish, respond fluently in Hindi or Hinglish. If the user asks in English, respond in English.\n" +
+    "3. Greetings: If the user greets you (e.g. 'hi', 'hello', 'namaste') or asks who you are, introduce yourself warmly as DocuSense AI and offer to help with their document.\n" +
+    "4. Explanations: When asked to explain or simplify concepts from the document, provide clear, easy-to-understand explanations while staying faithful to the document's core content.\n" +
+    "5. Related context: If the exact detail is not explicitly written in the context, do NOT bluntly say 'I couldn't find that'. Instead, explain what the document DOES state about related topics, provide the closest relevant details, and politely clarify what is not explicitly detailed in the document.\n" +
+    "6. Context awareness: Take previous conversation turns into account for follow-up questions.";
+
+  const userPrompt =
+    (formattedHistory ? `Recent Conversation History:\n${formattedHistory}\n\n` : "") +
+    `Document Context:\n${context}\n\n` +
+    `User Question: ${trimmedQ}\n` +
+    `Answer:`;
+
+  // Fall through model list until one answers
   let lastError = "";
   for (const name of CHAT_MODELS) {
     try {
-      const answer = await generate(name, prompt);
+      const answer = await generate(name, userPrompt, systemInstruction);
       console.log(`Answered with ${name}`);
       return {
         answer,
-        sources: matches.map((d) => (d.metadata?.source ? `[${d.metadata.source}] ` : "") + d.pageContent.slice(0, 200)),
+        sources: matches.map(
+          (d) => (d.metadata?.source ? `[${d.metadata.source}] ` : "") + d.pageContent.slice(0, 200)
+        ),
       };
     } catch (e: any) {
       lastError = String(e?.message || e);
       console.error(`Model ${name} failed:`, lastError);
-      if (e?.status === 401 || e?.status === 403) break; // Key problem, other models will fail too
+      if (e?.status === 401 || e?.status === 403) break; // Key error, other models will fail too
     }
   }
   throw new AppError(`Gemini could not answer: ${lastError.slice(0, 300)}`, 502);

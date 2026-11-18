@@ -58,7 +58,8 @@ export default function Chat({ session }: { session: Session | null }) {
     setMessages((m) => [...m, { role: "user", text: question }]);
     setLoading(true);
     try {
-      const res = await askQuestion(session.sessionId, question);
+      const history = messages.slice(-6).map((m) => ({ role: m.role, text: m.text }));
+      const res = await askQuestion(session.sessionId, question, history);
       setMessages((m) => [...m, { role: "bot", text: res.answer, sources: res.sources }]);
     } catch (err) {
       const text = err instanceof Error ? err.message : "Something went wrong.";
@@ -146,7 +147,7 @@ export default function Chat({ session }: { session: Session | null }) {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask a question about your PDF"
+          placeholder="Ask any question about your PDF (English, Hindi, etc.)..."
           maxLength={1000}
           disabled={loading}
         />
