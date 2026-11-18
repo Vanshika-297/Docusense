@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import multer from "multer";
 import { randomUUID } from "crypto";
-import { MAX_PDF_BYTES } from "./config";
+import { MAX_PDF_BYTES, MAX_CHUNKS } from "./config";
 import { AppError, extractText, chunkText } from "./pdf";
 import { ingestChunks, answerQuestion } from "./rag";
 
@@ -60,15 +60,26 @@ router.post("/upload", (req: Request, res: Response, next: NextFunction) => {
         throw new AppError("No readable text found in the provided PDF(s).");
       }
 
+      // If chunks exceed MAX_CHUNKS, evenly sample them so embedding completes quickly and within serverless timeouts
+      let docsToIngest = allDocs;
+      if (allDocs.length > MAX_CHUNKS) {
+        console.log(`Document produced ${allDocs.length} chunks. Sampling down to ${MAX_CHUNKS} for performance.`);
+        const step = allDocs.length / MAX_CHUNKS;
+        docsToIngest = [];
+        for (let i = 0; i < MAX_CHUNKS; i++) {
+          docsToIngest.push(allDocs[Math.floor(i * step)]);
+        }
+      }
+
       const sessionId = randomUUID(); // One Pinecone namespace per session
-      await withTimeout(ingestChunks(sessionId, allDocs), 50_000);
+      await withTimeout(ingestChunks(sessionId, docsToIngest), 50_000);
 
       const displayName =
         fileNames.length === 1 ? fileNames[0] : `${fileNames.length} PDFs (${fileNames.join(", ")})`;
 
       res.json({
         sessionId,
-        chunks: allDocs.length,
+        chunks: docsToIngest.length,
         fileName: displayName,
         fileCount: fileNames.length,
       });
@@ -101,13 +112,14 @@ router.post("/chat", async (req: Request, res: Response, next: NextFunction) => 
   }
 });
 
-// Turns any thrown error into a JSON message the UI can show.
+// Turns any thrown error into a clear JSON message the UI can show.
 export function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction) {
+  console.error("Server API Error:", err);
   if (err instanceof AppError) {
     return res.status(err.status).json({ error: err.message });
   }
-  console.error(err);
-  res.status(500).json({ error: "Something went wrong on the server. Please try again." });
+  const message = err?.message || "Something went wrong on the server. Please try again.";
+  res.status(500).json({ error: message });
 }
 
 export default router;

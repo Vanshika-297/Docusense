@@ -32,12 +32,19 @@ function getIndex() {
   return pc.index(requireEnv("PINECONE_INDEX"));
 }
 
-// Embeds the chunks and stores them in this session's own namespace.
+// Embeds the chunks and stores them in this session's own namespace in safe batches.
 export async function ingestChunks(sessionId: string, docs: Document[]) {
-  await PineconeStore.fromDocuments(docs, getEmbeddings(), {
-    pineconeIndex: getIndex(),
-    namespace: sessionId,
-  });
+  const embeddings = getEmbeddings();
+  const pineconeIndex = getIndex();
+  const BATCH_SIZE = 40; // Avoids hitting Google Gemini API batch limits and large payload sizes
+
+  for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+    const batch = docs.slice(i, i + BATCH_SIZE);
+    await PineconeStore.fromDocuments(batch, embeddings, {
+      pineconeIndex,
+      namespace: sessionId,
+    });
+  }
 }
 
 // Calls Gemini's REST endpoint with system instructions and generous timeout.

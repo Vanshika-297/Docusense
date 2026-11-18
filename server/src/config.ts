@@ -12,6 +12,8 @@ export const CHAT_MODEL = "gemini-flash-latest"; // Alias that always points to 
 // Reads a required env var or throws a clear error.
 export function requireEnv(name: string): string {
   const value = process.env[name];
-  if (!value) throw new Error(`Missing environment variable: ${name}`);
+  if (!value) {
+    throw new Error(`Missing environment variable: ${name}. Please set it in Vercel Project Settings -> Environment Variables.`);
+  }
   return value;
 }
