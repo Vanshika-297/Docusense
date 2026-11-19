@@ -65,7 +65,7 @@ export default function App() {
             {darkMode ? "☀️" : "🌙"}
           </button>
           <a
-            href="https://github.com/HariOm297/Docusense"
+            href="https://github.com/Vanshika-297/Docusense"
             target="_blank"
             rel="noreferrer"
             className="github-link"
