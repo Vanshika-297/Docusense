@@ -1,22 +1,37 @@
-import express from "express";
-import cors from "cors";
-import router, { errorHandler } from "./src/routes";
+import { Pinecone } from "@pinecone-database/pinecone";
 
-const app = express();
+const apiKey = process.env.PINECONE_API_KEY;
+const indexName = process.env.PINECONE_INDEX || "docusense-v1";
 
-// Only the origins in CORS_ORIGIN may call the API from another site (same-origin needs no CORS).
-app.use(cors({ origin: process.env.CORS_ORIGIN?.split(",") ?? false }));
-app.use(express.json({ limit: "10kb" }));
-
-// All endpoints live under the relative /api path.
-app.use("/api", router);
-app.use(errorHandler);
-
-// Run a local server only outside Vercel.
-if (!process.env.VERCEL) {
-  const port = Number(process.env.PORT) || 3001;
-  app.listen(port, () => console.log(`API running at http://localhost:${port}/api`));
+if (!apiKey) {
+  console.error("Missing PINECONE_API_KEY in environment.");
+  process.exit(1);
 }
 
-// Vercel runs the exported app as a serverless function.
-export default app;
+const pc = new Pinecone({ apiKey });
+
+try {
+  const list = await pc.listIndexes();
+  const existing = (list.indexes || []).find((idx) => idx.name === indexName);
+
+  if (existing) {
+    console.log(`Index "${indexName}" already exists with dimension ${existing.dimension}.`);
+  } else {
+    console.log(`Creating index "${indexName}" with dimension 3072...`);
+    await pc.createIndex({
+      name: indexName,
+      dimension: 3072,
+      metric: "cosine",
+      spec: {
+        serverless: {
+          cloud: "aws",
+          region: "us-east-1",
+        },
+      },
+    });
+    console.log(`Index "${indexName}" created successfully!`);
+  }
+} catch (err) {
+  console.error("Error creating/checking index:", err);
+  process.exit(1);
+}
